@@ -16,7 +16,7 @@ package main
 
 import (
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -24,12 +24,14 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"strings"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	influx "github.com/influxdata/influxdb/client/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
@@ -37,9 +39,10 @@ import (
 	"github.com/prometheus/common/promlog/flag"
 	"gopkg.in/alecthomas/kingpin.v2"
 
-	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/graphite"
+	// "github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/graphite"
 	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/influxdb"
-	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/opentsdb"
+	// "github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/opentsdb"
+	// "github.com/Kr1s77/prom_remote_storage_adapter/influxdb"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage/remote"
 )
@@ -58,6 +61,7 @@ type config struct {
 	listenAddr              string
 	telemetryPath           string
 	promlogConfig           promlog.Config
+	configPath              string
 }
 
 var (
@@ -142,12 +146,14 @@ func parseFlags() *config {
 		Default(":9201").StringVar(&cfg.listenAddr)
 	a.Flag("web.telemetry-path", "Address to listen on for web endpoints.").
 		Default("/metrics").StringVar(&cfg.telemetryPath)
+	a.Flag("config-path", "Host name config path").
+		Default("./remote_storage_adapter.conf").StringVar(&cfg.configPath)
 
 	flag.AddFlags(a, &cfg.promlogConfig)
 
 	_, err := a.Parse(os.Args[1:])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, fmt.Errorf("Error parsing commandline arguments: %w", err))
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error parsing commandline arguments"))
 		a.Usage(os.Args[1:])
 		os.Exit(2)
 	}
@@ -168,46 +174,126 @@ type reader interface {
 func buildClients(logger log.Logger, cfg *config) ([]writer, []reader) {
 	var writers []writer
 	var readers []reader
-	if cfg.graphiteAddress != "" {
-		c := graphite.NewClient(
-			log.With(logger, "storage", "Graphite"),
-			cfg.graphiteAddress, cfg.graphiteTransport,
-			cfg.remoteTimeout, cfg.graphitePrefix)
-		writers = append(writers, c)
+	// if cfg.graphiteAddress != "" {
+	// 	c := graphite.NewClient(
+	// 		log.With(logger, "storage", "Graphite"),
+	// 		cfg.graphiteAddress, cfg.graphiteTransport,
+	// 		cfg.remoteTimeout, cfg.graphitePrefix)
+	// 	writers = append(writers, c)
+	// }
+	// if cfg.opentsdbURL != "" {
+	// 	c := opentsdb.NewClient(
+	// 		log.With(logger, "storage", "OpenTSDB"),
+	// 		cfg.opentsdbURL,
+	// 		cfg.remoteTimeout,
+	// 	)
+	// 	writers = append(writers, c)
+	// }
+
+	// if cfg.configPath = "" {
+	// 	level.Error(logger).Log("msg", "Failse to get InfluxDB hostname config path")
+	// 	os.Exit(1)
+	// }
+	// 添加文件读取，支持多个 hostname 读取 influxdb
+	fmt.Println(cfg.configPath)
+	file, err := os.Open(cfg.configPath)
+	if err != nil {
+		level.Error(logger).Log("msg", "Failse to parse InfluxDB hostname config path", cfg.configPath, "err", err)
+		os.Exit(1)
 	}
-	if cfg.opentsdbURL != "" {
-		c := opentsdb.NewClient(
-			log.With(logger, "storage", "OpenTSDB"),
-			cfg.opentsdbURL,
-			cfg.remoteTimeout,
-		)
-		writers = append(writers, c)
+
+	fileinfo, err := file.Stat()
+	if err != nil {
+		level.Error(logger).Log("msg", "Failse to parse InfluxDB hostname config Stat", cfg.configPath, "err", err)
+		os.Exit(1)
 	}
-	if cfg.influxdbURL != "" {
-		url, err := url.Parse(cfg.influxdbURL)
-		if err != nil {
-			level.Error(logger).Log("msg", "Failed to parse InfluxDB URL", "url", cfg.influxdbURL, "err", err)
-			os.Exit(1)
+	filesize := fileinfo.Size()
+	buffer := make([]byte, filesize)
+	bytesread, err := file.Read(buffer)
+	if err != nil {
+		level.Error(logger).Log("msg", "Failse to parse InfluxDB hostname config Stat", cfg.configPath, "err", err)
+		os.Exit(1)
+	}
+	stringBuffer := string(buffer)
+	influxSettings := strings.Split(stringBuffer, "\n")
+	fmt.Println("bytes read: ", bytesread)
+	// fmt.Println("bytestream to string: ", string(buffer))
+
+	for index, influxSetting := range influxSettings{
+		if influxSetting == "" {
+			continue
 		}
-		conf := influx.HTTPConfig{
-			Addr:     url.String(),
-			Username: cfg.influxdbUsername,
-			Password: cfg.influxdbPassword,
-			Timeout:  cfg.remoteTimeout,
+		if influxSetting == " " {
+			continue
 		}
-		c := influxdb.NewClient(
-			log.With(logger, "storage", "InfluxDB"),
-			conf,
-			cfg.influxdbDatabase,
-			cfg.influxdbRetentionPolicy,
-		)
-		prometheus.MustRegister(c)
-		writers = append(writers, c)
-		readers = append(readers, c)
+		fmt.Println("Set InfluxDB client", index, ":", influxSetting)
+		influxConnector :=  strings.Split(influxSetting, " ")
+		hostname := influxConnector[0]
+		influxdbURL := influxConnector[len(influxConnector) - 1]
+		if influxdbURL != "" {
+			url, err := url.Parse(influxdbURL)
+			if err != nil {
+				level.Error(logger).Log("msg", "Failed to parse InfluxDB URL", "url", cfg.influxdbURL, "err", err)
+				os.Exit(1)
+			}
+			conf := influx.HTTPConfig{
+				Addr:     url.String(),
+				Username: cfg.influxdbUsername,
+				Password: cfg.influxdbPassword,
+				Timeout:  cfg.remoteTimeout,
+			}
+			c := influxdb.NewClient(
+				log.With(logger, "storage", "InfluxDB"),
+				conf,
+				cfg.influxdbDatabase,
+				cfg.influxdbRetentionPolicy,
+				hostname,
+			)
+			// prometheus.MustRegister(c)
+			writers = append(writers, c)
+			readers = append(readers, c)
+			// break
+		}
 	}
+
+	file.Close()
+	
 	level.Info(logger).Log("msg", "Starting up...")
 	return writers, readers
 }
+
+
+func QueriesToReader(Queries []*prompb.Query, readers []reader) ([]reader){
+	/*  
+	指定 hostname 时，会直接返回匹配到 hostname 的 reader
+	如果请求没有指定 hostname 不会匹配 reader，会返回所有 reader
+	*/
+	var matchedReader []reader
+	for _, q := range Queries {
+		for _, m := range q.Matchers {
+			switch m.Type {
+			case prompb.LabelMatcher_EQ:
+				if m.Name == "host" {
+					hostname := escapeSingleQuotes(m.Value)
+					for _, readerRange := range readers {
+						if readerRange.Name() != hostname {
+							continue
+						}
+						matchedReader = append(matchedReader, readerRange)
+					}
+				}
+			}
+		}
+	}
+	
+	// 返回所有 readers
+	if len(matchedReader) == 0 {
+		matchedReader = readers
+	}
+
+	return matchedReader
+}
+
 
 func serve(logger log.Logger, addr string, writers []writer, readers []reader) error {
 	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
@@ -233,7 +319,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 	})
 
 	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
-		compressed, err := io.ReadAll(r.Body)
+		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			level.Error(logger).Log("msg", "Read error", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -255,20 +341,35 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 		}
 
 		// TODO: Support reading from more than one reader and merging the results.
-		if len(readers) != 1 {
+		if len(readers) < 1 {
 			http.Error(w, fmt.Sprintf("expected exactly one reader, found %d readers", len(readers)), http.StatusInternalServerError)
 			return
 		}
-		reader := readers[0]
 
+	
+		matchedReaders := QueriesToReader(req.Queries, readers)
+		// var Results []*prompb.QueryResult
 		var resp *prompb.ReadResponse
-		resp, err = reader.Read(&req)
-		if err != nil {
-			level.Warn(logger).Log("msg", "Error executing query", "query", req, "storage", reader.Name(), "err", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		for index, reader := range matchedReaders {
+			// var resp *prompb.ReadResponse
+			response, err := reader.Read(&req)
+			
+			// 注意，出现一个错误的地方可以不用显示，不用所有的正确，这里需要判断是否处理
+			if err != nil {
+				level.Warn(logger).Log("msg", "Error executing query", "query", req, "storage", reader.Name(), "err", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 
+			if index == 0 {
+				resp = response
+				continue
+			}
+
+			for _, ts := range response.Results[0].Timeseries {
+				resp.Results[0].Timeseries = append(resp.Results[0].Timeseries, ts)
+			}
+		}
 		data, err := proto.Marshal(resp)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -277,10 +378,10 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 
 		w.Header().Set("Content-Type", "application/x-protobuf")
 		w.Header().Set("Content-Encoding", "snappy")
-
 		compressed = snappy.Encode(nil, data)
 		if _, err := w.Write(compressed); err != nil {
-			level.Warn(logger).Log("msg", "Error writing response", "storage", reader.Name(), "err", err)
+			// level.Warn(logger).Log("msg", "Error writing response", "storage", reader.Name(), "err", err)
+			level.Warn(logger).Log("msg", "Error writing response", "storage", "err", err)
 		}
 	})
 
@@ -316,4 +417,9 @@ func sendSamples(logger log.Logger, w writer, samples model.Samples) {
 	}
 	sentSamples.WithLabelValues(w.Name()).Add(float64(len(samples)))
 	sentBatchDuration.WithLabelValues(w.Name()).Observe(duration)
+}
+
+
+func escapeSingleQuotes(str string) string {
+	return strings.Replace(str, `'`, `\'`, -1)
 }
