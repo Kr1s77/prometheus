@@ -15,15 +15,15 @@ package influxdb
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"os"
 	"strings"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	influx "github.com/influxdata/influxdb/client/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
@@ -33,7 +33,8 @@ import (
 // Client allows sending batches of Prometheus samples to InfluxDB.
 type Client struct {
 	logger log.Logger
-
+    
+	hostname        string
 	client          influx.Client
 	database        string
 	retentionPolicy string
@@ -41,7 +42,7 @@ type Client struct {
 }
 
 // NewClient creates a new Client.
-func NewClient(logger log.Logger, conf influx.HTTPConfig, db, rp string) *Client {
+func NewClient(logger log.Logger, conf influx.HTTPConfig, db string, rp string, hostname string) *Client {
 	c, err := influx.NewHTTPClient(conf)
 	// Currently influx.NewClient() *should* never return an error.
 	if err != nil {
@@ -57,6 +58,7 @@ func NewClient(logger log.Logger, conf influx.HTTPConfig, db, rp string) *Client
 		logger:          logger,
 		client:          c,
 		database:        db,
+		hostname:        hostname,
 		retentionPolicy: rp,
 		ignoredSamples: prometheus.NewCounter(
 			prometheus.CounterOpts{
@@ -149,13 +151,19 @@ func (c *Client) buildCommand(q *prompb.Query) (string, error) {
 	matchers := make([]string, 0, len(q.Matchers))
 	// If we don't find a metric name matcher, query all metrics
 	// (InfluxDB measurements) by default.
+	
 	from := "FROM /.+/"
 	for _, m := range q.Matchers {
 		if m.Name == model.MetricNameLabel {
 			switch m.Type {
 			case prompb.LabelMatcher_EQ:
-				from = fmt.Sprintf("FROM %q.%q", c.retentionPolicy, m.Value)
+				messages := strings.Split(m.Value, "__")
+				tableName := messages[0]
+				value := messages[1]
+				from = fmt.Sprintf("%q FROM %q.%q", value, c.retentionPolicy, tableName)
+				// fmt.Println("LabelMatcher_EQ1", m.Value)
 			case prompb.LabelMatcher_RE:
+				// fmt.Println("LabelMatcher_EQ", m.Value)
 				from = fmt.Sprintf("FROM %q./^%s$/", c.retentionPolicy, escapeSlashes(m.Value))
 			default:
 				// TODO: Figure out how to support these efficiently.
@@ -174,13 +182,17 @@ func (c *Client) buildCommand(q *prompb.Query) (string, error) {
 		case prompb.LabelMatcher_NRE:
 			matchers = append(matchers, fmt.Sprintf("%q !~ /^%s$/", m.Name, escapeSlashes(m.Value)))
 		default:
-			return "", fmt.Errorf("unknown match type %v", m.Type)
+			return "", errors.Errorf("unknown match type %v", m.Type)
 		}
 	}
+	matchers = append(matchers, fmt.Sprintf("%q = '%s'", "host", c.Name()))
 	matchers = append(matchers, fmt.Sprintf("time >= %vms", q.StartTimestampMs))
 	matchers = append(matchers, fmt.Sprintf("time <= %vms", q.EndTimestampMs))
 
-	return fmt.Sprintf("SELECT value %s WHERE %v GROUP BY *", from, strings.Join(matchers, " AND ")), nil
+	// return fmt.Sprintf("SELECT value %s WHERE %v GROUP BY *", from, strings.Join(matchers, " AND ")), nil
+	sql := fmt.Sprintf("SELECT %s WHERE %v GROUP BY *", from, strings.Join(matchers, " AND "))
+	fmt.Println("Sql: ", sql)
+	return sql, nil
 }
 
 func escapeSingleQuotes(str string) string {
@@ -250,32 +262,47 @@ func tagsToLabelPairs(name string, tags map[string]string) []prompb.Label {
 }
 
 func valuesToSamples(values [][]interface{}) ([]prompb.Sample, error) {
+
 	samples := make([]prompb.Sample, 0, len(values))
 	for _, v := range values {
 		if len(v) != 2 {
-			return nil, fmt.Errorf("bad sample tuple length, expected [<timestamp>, <value>], got %v", v)
+			return nil, errors.Errorf("bad sample tuple length, expected [<timestamp>, <value>], got %v", v)
 		}
 
 		jsonTimestamp, ok := v[0].(json.Number)
 		if !ok {
-			return nil, fmt.Errorf("bad timestamp: %v", v[0])
-		}
-
-		jsonValue, ok := v[1].(json.Number)
-		if !ok {
-			return nil, fmt.Errorf("bad sample value: %v", v[1])
+			return nil, errors.Errorf("bad timestamp: %v", v[0])
 		}
 
 		timestamp, err := jsonTimestamp.Int64()
 		if err != nil {
-			return nil, fmt.Errorf("unable to convert sample timestamp to int64: %w", err)
+			return nil, errors.Wrap(err, "unable to convert sample timestamp to int64")
 		}
+
+		// disable true or false value type
+		jsonValue, ok := v[1].(json.Number)
+		if !ok {
+			i := 0
+			if v[1] == true {
+				i = 1
+			} else if v[1] == false {
+				i = 0
+			} else {
+				return nil, errors.Errorf("bad sample value: %v", v[1])
+			}
+
+			value := float64(i)
+			samples = append(samples, prompb.Sample{
+				Timestamp: timestamp,
+				Value:     value,
+			})
+			continue
+		} 
 
 		value, err := jsonValue.Float64()
 		if err != nil {
-			return nil, fmt.Errorf("unable to convert sample value to float64: %w", err)
+			return nil, errors.Wrap(err, "unable to convert sample value to float64")
 		}
-
 		samples = append(samples, prompb.Sample{
 			Timestamp: timestamp,
 			Value:     value,
@@ -309,8 +336,13 @@ func mergeSamples(a, b []prompb.Sample) []prompb.Sample {
 
 // Name identifies the client as an InfluxDB client.
 func (c Client) Name() string {
-	return "influxdb"
+	// return "influxdb"
+	return c.hostname
 }
+
+// func (c *Client) HostName() string {
+// 	return c.hostname
+// }
 
 // Describe implements prometheus.Collector.
 func (c *Client) Describe(ch chan<- *prometheus.Desc) {
