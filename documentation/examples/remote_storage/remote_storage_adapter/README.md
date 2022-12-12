@@ -31,7 +31,7 @@ OpenTSDB example:
 InfluxDB example:
 
 ```
-./remote_storage_adapter --influxdb-url=http://localhost:8086/ --influxdb.database=prometheus --influxdb.retention-policy=autogen
+./remote_storage_adapter --influxdb-url=http://localhost:8086/ --influxdb.database=prometheus --influxdb.retention-policy=autogen --config-path=remote_storage_adapter.conf
 ```
 
 To show all flags:
@@ -52,4 +52,5 @@ remote_write:
 # Remote read configuration (for InfluxDB only at the moment).
 remote_read:
   - url: "http://localhost:9201/read"
+    read_recent: true
 ```
