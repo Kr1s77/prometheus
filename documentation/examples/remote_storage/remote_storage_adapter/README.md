@@ -54,3 +54,29 @@ remote_read:
   - url: "http://localhost:9201/read"
     read_recent: true
 ```
+
+## The configuration I'm using <prometheus.yml>
+```yaml
+# my global config
+global:
+  scrape_interval:     15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  # scrape_timeout is set to the global default (10s).
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      # - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# just need read option
+remote_read:
+  - url: "http://localhost:9201/read?db=monitor"
+    read_recent: true
+```
